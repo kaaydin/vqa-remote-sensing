@@ -12,7 +12,7 @@ from tqdm import tqdm
 matplotlib.use('Agg')
 
 
-import VQADataset_Multitask as VQADataset
+import datasets.VQADataset_Att as VQADataset
 import torchvision.transforms as T
 import torch
 import numpy as np
@@ -23,7 +23,7 @@ import datetime
 
 import wandb
 from models import model_vit as model
-from models import multitask as multitask
+from models import multitask_attention as multitask
 
 def vqa_collate_fn(batch):
     # Separate the list of tuples into individual lists
@@ -39,13 +39,16 @@ def vqa_collate_fn(batch):
     return questions_batch, answers_batch, images_batch, question_types_batch, question_types_str
 
 def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learning_rate, lr_fc, experiment_name, wandb_args, num_workers=4):
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=vqa_collate_fn)
-    validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=vqa_collate_fn)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, persistent_workers=True, num_workers=num_workers, pin_memory=True, collate_fn=vqa_collate_fn)
+    validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=batch_size, shuffle=False, persistent_workers=True, num_workers=num_workers, pin_memory=True, collate_fn=vqa_collate_fn)
     
-    
-    optimizer = torch.optim.Adam(model.shared_parameters(), lr=learning_rate)
+    # in the current implementation, we do not have shared parameters, except for the feature extractors (which are not trained)
+    # if we want to share additional parameters, we need to add them to the shared_parameters() function in the model and uncomment the following line
+    # as well as after the prediction step in the training loop
+    #optimizer = torch.optim.Adam(model.shared_parameters(), lr=learning_rate)
     optimizer_heads = [torch.optim.Adam(classifier.parameters(), lr=lr_fc[i]) for i, classifier in enumerate(model.classifiers, 0)]
     criterion = torch.nn.CrossEntropyLoss()
+    schedulers = [torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_head, patience=3, verbose=True, mode="max") for optimizer_head in optimizer_heads]
 
     # Create a directory for the experiment outputs
     output_dir = Path(f"outputs/{experiment_name}")
@@ -100,12 +103,10 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
             question_type = question_type.to("cuda")
 
             pred = model(image, question, question_type)
-            # print predicted class (index with highest probability)
 
             loss = criterion(pred, answer)
             
             samples_per_task = [(question_type == qt).sum().item() for qt in range(4)]
-            #print(f"Samples per task: {samples_per_task}")
 
             #Calculate initial weights inversely proportional to class frequencies
             weights = [1.0 / (count if count > 0 else 1) for count in samples_per_task]
@@ -119,7 +120,6 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
             #Normalize the weights
             weight_sum = sum(weights)
             normalized_weights = [weight / weight_sum for weight in weights] 
-            #print(f"Normalized Weights: {normalized_weights}")
             if i % log_interval == 0:
                 wandb.log({["weight_0", "weight_1", "weight_2", "weight_3"][qt]: normalized_weights[qt] for qt in range(4)})
                 wandb.log({["samples_0", "samples_1", "samples_2", "samples_3"][qt]: samples_per_task[qt]/sum(samples_per_task) for qt in range(4)})
@@ -144,14 +144,14 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
                     predicted_counts = pred_qt.argmax(dim=1)
                     actual_counts = answer_qt
 
-                    # Calculate auxiliary loss (e.g., MSE or MAE)
-                    auxiliary_loss_qt = torch.nn.functional.mse_loss(predicted_counts.float(), actual_counts.float())
+                    # Calculate auxiliary loss MAE
+                    auxiliary_loss_qt = torch.nn.functional.l1_loss(predicted_counts.float(), actual_counts.float())
 
                     if i % log_interval == 0:
                         wandb.log({"epoch": epoch, "auxiliary_loss": auxiliary_loss_qt})
 
                     # Combine primary and auxiliary losses
-                    loss_qt += auxiliary_loss_qt
+                    #loss_qt * 0.8 += auxiliary_loss_qt * 0.2
                 
                 task_specific_losses.append(loss_qt * normalized_weights[qt])
                 if i % log_interval == 0:
@@ -161,18 +161,18 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
             loss_total = sum(task_specific_losses)
 
             # Zero the gradients for the shared and task-specific parameters
-            optimizer.zero_grad()
+            #optimizer.zero_grad()
             for optimizer_head in optimizer_heads:
                 optimizer_head.zero_grad()
 
             # Backpropagate the total loss
             loss_total.backward()
 
-            
+            # Now, update all parameters
             for optimizer_head in optimizer_heads:
                 optimizer_head.step()
-            # Now, update all parameters
-            optimizer.step()
+            
+            #optimizer.step()
             if i % log_interval == 0:
                 wandb.log({"epoch": epoch, "loss": loss})
                 wandb.log({"epoch": epoch, "loss_total": loss_total})
@@ -196,7 +196,7 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
             countQuestionType = {'presence': 0, 'count': 0, 'comp': 0, 'area': 0}
             rightAnswerByQuestionType = {'presence': 0, 'count': 0, 'comp': 0, 'area': 0}
 
-            # Implementing tqdm for the validation loop, similar to the training loop
+            # tqdm for the validation loop
             progress_bar = tqdm(enumerate(validate_loader, 0), total=len(validate_loader), desc="Validating", position=0, leave=False)
 
             for i, data in progress_bar:
@@ -206,7 +206,7 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
                 answer = answer.to("cuda")
                 image = image.to("cuda")
                 question_type = question_type.to("cuda")
-                answer = answer.squeeze(1)  # Removing an extraneous dimension from the answers
+                answer = answer.squeeze(1)  # Removing an extraneous dimension from the answers (added during saving)
 
                 pred = model(image, question, question_type)
                 loss = criterion(pred, answer)
@@ -221,6 +221,13 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
             print('epoch #%d val loss: %.3f' % (epoch, valLoss[epoch]))
             wandb.log({"val_loss": valLoss[-1]})
             print(datetime.datetime.now())  
+
+            question_type_to_idx = {
+                "presence": 0,
+                "comp": 1,
+                "area": 2,
+                "count": 3,
+            }
         
             numQuestions = 0
             numRightQuestions = 0
@@ -231,6 +238,8 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
                     accPerQuestionType[question_type].append(accPerQuestiontype_tmp)
                     wandb.log({"epoch": epoch, question_type: accPerQuestiontype_tmp})
                     print(f"{question_type}: {accPerQuestiontype_tmp}")
+                    schedulers[question_type_to_idx[question_type]].step(accPerQuestiontype_tmp)
+                    wandb.log({"epoch": epoch, f"lr_{question_type}": schedulers[question_type_to_idx[question_type]].optimizer.param_groups[0]['lr']})
                 numQuestions += countQuestionType[question_type]
                 numRightQuestions += rightAnswerByQuestionType[question_type]
                 currentAA += accPerQuestionType[question_type][epoch]
@@ -252,17 +261,11 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
         "total_time_in_hours": (epoch_end_time - epoch_start_time).total_seconds() / 3600,
         }
         experiment_log["epoch_data"].append(epoch_info)
-        # Save the JSON log file after each epoch
-        epoch_log_file = output_dir / f"epoch_{epoch}_log.json"
-        with open(epoch_log_file, 'w') as outfile:
-            json.dump(epoch_info, outfile, indent=4)
     end_time = datetime.datetime.now()
     # Calculate and save final results or other relevant info
     experiment_log["final_results"] = {
         "average_train_loss": sum(trainLoss) / len(trainLoss),
         "average_val_loss": sum(valLoss) / len(valLoss),
-        "OA-epochs": sum(OA) / len(OA),
-        "AA-epochs": sum(AA) / len(AA),
         "start_time": start_time.strftime("%Y-%m-%d_%H:%M:%S"),
         "end_time": end_time.strftime("%Y-%m-%d_%H:%M:%S"),
         "total_time_in_hours": (end_time - start_time).total_seconds() / 3600
@@ -279,42 +282,47 @@ if __name__ == '__main__':
     torch.autograd.set_detect_anomaly(True)
     disable_log = False
     learning_rate = 1e-5
-    learning_rates = [1e-5, 1e-5, 1e-5, 3e-5]
+    learning_rates = [1e-5, 1e-5, 2e-5, 1e-5]
     ratio_images_to_use = 1
-    modeltype = 'RNN_ViT-B-Multi-weight-norm-aux-loss'
+    modeltype = 'ViT-Bert-Attention-Multitask-MUTAN'
     Dataset = 'HR'
 
-    batch_size = 700
+    batch_size = 70
     num_epochs = 35
     patch_size = 512   
-    num_workers = 0
+    num_workers = 12
 
     work_dir = os.getcwd()
     data_path = work_dir + '/data'
-    images_path = data_path + '/image_representations_vit'
-    questions_path = data_path + '/text_representations_mt'
+    images_path = data_path + '/image_representations_vit_att'
+    questions_path = data_path + '/text_representations_bert' 
     questions_train_path = questions_path + '/train'
     questions_val_path = questions_path + '/val'
     experiment_name = f"{modeltype}_lr_{learning_rate}_batch_size_{batch_size}_run_{datetime.datetime.now().strftime('%m-%d_%H_%M')}"
 
     wandb_args = {
             "learning_rate": learning_rate,
+            "learning_rates_fc": learning_rates,
             "ratio_images_to_use": ratio_images_to_use,
             "modeltype": modeltype,
             "Dataset": Dataset,
             "batch_size": batch_size,
             "num_epochs": num_epochs,
             "patch_size": patch_size,
-            "num_workers": num_workers,
+            "num_workers": num_workers,   
             "log_interval": 100,
             "experiment_name": experiment_name,
-            "focus_increase_factors":  {} # Increase the weight of the a question type by x
+            "focus_increase_factors":  {}, # Increase the weight of the a question type by x
+            "fusion_in": 1200,
+            "fusion_hidden": 256,
+            "fusion_hidden_2": 128,
         }
 
-    train_dataset = VQADataset.VQADataset_Multitask(questions_train_path, images_path)
-    validate_dataset = VQADataset.VQADataset_Multitask(questions_val_path, images_path) 
+    train_dataset = VQADataset.VQADataset(questions_train_path, images_path)
+    validate_dataset = VQADataset.VQADataset(questions_val_path, images_path) 
     
-    RSVQA = multitask.MultiTaskVQAModel()
-    train(RSVQA, train_dataset, validate_dataset, batch_size, num_epochs, learning_rate, learning_rates, experiment_name, wandb_args, num_workers)
+    # load from checkpoint
+    mod = multitask.MultiTaskVQAModel().cuda()
+    train(mod, train_dataset, validate_dataset, batch_size, num_epochs, learning_rate, learning_rates, experiment_name, wandb_args, num_workers)
     
     

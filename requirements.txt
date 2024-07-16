@@ -4,6 +4,12 @@ matplotlib
 scikit-image
 scikit-learn
 pickles
+transformers
+torch
+torchvision
+wandb
+tqdm
+block.bootstrap.pytorch
 #skipthoughts
 
 #git clone https://github.com/Cadene/skip-thoughts.torch.git

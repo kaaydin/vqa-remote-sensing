@@ -6,14 +6,9 @@
 
 import json
 from pathlib import Path
-import matplotlib
 from tqdm import tqdm
 
-matplotlib.use('Agg')
-
-
-import VQADataset
-import torchvision.transforms as T
+import datasets.VQADataset_Att as VQADataset
 import torch
 import numpy as np
 
@@ -22,31 +17,26 @@ import os
 import datetime
 
 import wandb
-import model, attention
+from models import model
 
 def vqa_collate_fn(batch):
     # Separate the list of tuples into individual lists
-    questions, answers, images, question_types = zip(*batch)
+    questions, answers, images, question_types_idx, question_types = zip(*batch)
 
     # Convert tuples to appropriate tensor batches
     questions_batch = torch.stack(questions)
     answers_batch = torch.stack(answers)  
     images_batch = torch.stack(images)  
-    # For question_types, you can choose whether to convert to tensor or leave as a list
-    
+
     return questions_batch, answers_batch, images_batch, question_types
 
-def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learning_rate, experiment_name, num_workers):
+def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learning_rate, experiment_name, wandb_args, num_workers=4):
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, persistent_workers=True, pin_memory=True, collate_fn=vqa_collate_fn)
+    validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=True, pin_memory=True, collate_fn=vqa_collate_fn)
     
-    ## Create data loaders for the training and validation sets
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=vqa_collate_fn)
-    validate_loader = torch.utils.data.DataLoader(validate_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=vqa_collate_fn)
+    model = model.to("cuda")
     
-    ## Move the model to the GPU if available
-    model = model.to("mps")
-    
-    ## Define the optimizer and loss function
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)#, weight_decay=0.0001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = torch.nn.CrossEntropyLoss()
 
     # Create a directory for the experiment outputs
@@ -65,13 +55,16 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
         "final_results": {},
         "epoch_data": [],  
     }
-    wandb.init(project="rsvitqa", name=experiment_name, config=wandb_args)
+    wandb.init(
+        project="rsvitqa", 
+        name=experiment_name,
+        config=wandb_args
+        )
     log_interval = wandb.config.get("log_interval")
-    model = model.to("mps")
+    model = model.to("cuda")
     # magic
     wandb.watch(model, log_freq=log_interval)
-
-
+        
     trainLoss = []
     valLoss = []
 
@@ -91,47 +84,34 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
         progress_bar = tqdm(enumerate(train_loader, 0), total=len(train_loader), desc=f"Epoch {epoch+1}", position=0, leave=False)
 
         for i, data in progress_bar:
-            
-            ## Get the inputs
             question, answer, image, _ = data
 
-            # print("Shape of Question:", question.shape)
-            # print("Shape of Answer:", answer.shape)
-            # print("Shape of Image:", image.shape)
+            question = question.to("cuda")
+            answer = answer.to("cuda")
+            image = image.to("cuda")
 
-            ## Move to GPU if available
-            question = question.to("mps")
-            answer = answer.to("mps")
-            image = image.to("mps")
-
-            ## Remove extraneous dimension from the answers
             answer = answer.squeeze(1)
 
-            ## Forward pass
             pred = model(image, question)
-            
-            ## Calculate loss, backpropagation, and optimization
             loss = criterion(pred, answer)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-            ## Log metrics to W&B
             if i % log_interval == 0:
                 wandb.log({"epoch":  epoch, "loss": loss})
-            
             # Update running loss and display it in the progress bar
             current_loss = loss.item()
             runningLoss += current_loss
 
-            # Update the progress bar with additional info
+            # update the progress bar with additional info
             progress_bar.set_postfix({'training_loss': '{:.6f}'.format(current_loss)})
         
             
         trainLoss.append(runningLoss / len(train_dataset))
         print('epoch #%d loss: %.3f' % (epoch, trainLoss[epoch]))
-        # model_save_path = output_dir / f"RSVQA_model_epoch_{epoch}.pth"
-        # torch.save(model.state_dict(), model_save_path)
+        model_save_path = output_dir / f"RSVQA_model_epoch_{epoch}.pth"
+        torch.save(model.state_dict(), model_save_path)
 
         with torch.no_grad():
             model.eval()  # Make sure that the model is in evaluation mode
@@ -141,15 +121,15 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
             countQuestionType = {'presence': 0, 'count': 0, 'comp': 0, 'area': 0}
             rightAnswerByQuestionType = {'presence': 0, 'count': 0, 'comp': 0, 'area': 0}
 
-            # Implementing tqdm for the validation loop, similar to the training loop
+            # tqdm for the validation loop, similar to the training loop
             progress_bar = tqdm(enumerate(validate_loader, 0), total=len(validate_loader), desc="Validating", position=0, leave=False)
 
             for i, data in progress_bar:
-                question, answer, image, type_str = data
+                question, answer, image, type_idx, type_str = data
 
-                question = question.to("mps")
-                answer = answer.to("mps")
-                image = image.to("mps")
+                question = question.to("cuda")
+                answer = answer.to("cuda")
+                image = image.to("cuda")
 
                 answer = answer.squeeze(1)  # Removing an extraneous dimension from the answers
 
@@ -174,7 +154,7 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
                 if countQuestionType[type_str] > 0:
                     accPerQuestiontype_tmp = rightAnswerByQuestionType[type_str] * 1.0 / countQuestionType[type_str]
                     accPerQuestionType[type_str].append(accPerQuestiontype_tmp)
-                    wandb.log({type_str: accPerQuestiontype_tmp})
+                    wandb.log({"epoch": epoch, type_str: accPerQuestiontype_tmp})
                     print(f"{type_str}: {accPerQuestiontype_tmp}")
                 numQuestions += countQuestionType[type_str]
                 numRightQuestions += rightAnswerByQuestionType[type_str]
@@ -209,11 +189,11 @@ def train(model, train_dataset, validate_dataset, batch_size, num_epochs, learni
         "OA-epochs": sum(OA) / len(OA),
         "AA-epochs": sum(AA) / len(AA),
         "OA-max": {
-            "epoch": np.argmax(OA),
+            "epoch": int(np.argmax(OA)),
             "value": np.max(OA)
         },
         "AA-max": {
-            "epoch": np.argmax(AA),
+            "epoch": int(np.argmax(AA)),
             "value": np.max(AA)
         },
         "start_time": start_time.strftime("%Y-%m-%d_%H:%M:%S"),
@@ -237,22 +217,39 @@ if __name__ == '__main__':
             'num_epochs': 35,
             'learning_rate': 0.00001
             },
+            # {
+            # 'batch_size': 700,
+            # 'num_epochs': 35,
+            # 'learning_rate': 0.00001
+            # },
+            # {
+            # 'batch_size': 700,
+            # 'num_epochs': 35,
+            # 'learning_rate': 0.0001
+            # },
+            # {
+            # 'batch_size': 1400,
+            # 'num_epochs': 35,
+            # 'learning_rate': 0.0001
+            # }
         ]
+
     
-    modeltype = 'ViT_BERT_Attention'
+    modeltype = 'ViT-BERT-Attention-MUTAN'
     Dataset = 'HR'
     patch_size = 512   
-    num_workers = 2
+    num_workers = 6
+
 
     for config in train_configs:
         batch_size = config['batch_size']
         num_epochs = config['num_epochs']
         learning_rate = config['learning_rate']
 
-        work_dir = "/Users/kaanaydin/RSViTQA"
-        data_path = work_dir + '/data/preprocessed_data'
-        images_path = data_path + '/image_representations_vit'
-        questions_path = data_path + '/text_representations_bert'
+        work_dir = os.getcwd()
+        data_path = work_dir + '/data'
+        images_path = data_path + '/image_representations_vit_att'
+        questions_path = data_path + '/text_representations_bert_att'
         questions_train_path = questions_path + '/train'
         questions_val_path = questions_path + '/val'
         experiment_name = f"{modeltype}_lr_{learning_rate}_batch_size_{batch_size}_run_{datetime.datetime.now().strftime('%m-%d_%H_%M')}"
@@ -270,7 +267,9 @@ if __name__ == '__main__':
             }
         
         train_dataset = VQADataset.VQADataset(questions_train_path, images_path)
-        validate_dataset = VQADataset.VQADataset(questions_val_path, images_path)
+        validate_dataset = VQADataset.VQADataset(questions_val_path, images_path) 
         
         RSVQA = model.VQAModel()
-        train(RSVQA, train_dataset, validate_dataset, batch_size, num_epochs, learning_rate, experiment_name, num_workers)
+        train(RSVQA, train_dataset, validate_dataset, batch_size, num_epochs, learning_rate, experiment_name, wandb_args, num_workers)
+    
+    

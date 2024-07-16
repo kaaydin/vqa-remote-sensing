@@ -11,7 +11,7 @@ question_type_to_idx = {
     "comp": 1,
 }
 
-class VQADataset_Multitask(Dataset):
+class VQADataset(Dataset):
     def __init__(self, textual_path, visual_path):
         self.textual_path = textual_path
         self.visual_path = visual_path
